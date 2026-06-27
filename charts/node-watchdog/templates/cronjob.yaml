@@ -21,14 +21,14 @@ spec:
           restartPolicy: OnFailure
           initContainers:
             - name: kubectl-provider
-              image: {{ .Values.image.kubectl.repository }}:{{ .Values.image.kubectl.tag }}
+              image: {{ include "node-watchdog.image" .Values.image.kubectl }}
               command: ["sh", "-c", "cp $(which kubectl) /shared/kubectl"]
               volumeMounts:
                 - name: shared-bin
                   mountPath: /shared
           containers:
             - name: watchdog
-              image: {{ .Values.image.ceph.repository }}:{{ .Values.image.ceph.tag }}
+              image: {{ include "node-watchdog.image" .Values.image.ceph }}
               command: ["/bin/bash", "/scripts/watchdog.sh"]
               resources:
                 requests:

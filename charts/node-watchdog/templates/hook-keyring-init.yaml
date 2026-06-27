@@ -72,7 +72,7 @@ spec:
         kubernetes.io/hostname: {{ .Values.cephNode }}
       containers:
         - name: keyring-init
-          image: {{ .Values.image.kubectl.repository }}:{{ .Values.image.kubectl.tag }}
+          image: {{ include "node-watchdog.image" .Values.image.kubectl }}
           securityContext:
             runAsUser: 0
           command:

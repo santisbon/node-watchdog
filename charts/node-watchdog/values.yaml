@@ -23,6 +23,8 @@ image:
     tag: v19.2.3
   kubectl:
     repository: bitnami/kubectl
-    # Must match your MicroK8s version to avoid API skew.
-    # Check on node with: snap info microk8s | grep installed
-    tag: "1.36.2"
+    tag: "latest"
+    # Bitnami no longer publishes versioned tags to Docker Hub. Digest pins the
+    # exact image (currently 1.36.2) without relying on the floating "latest" tag.
+    # To update: re-run the digest lookup and replace the value below.
+    digest: "sha256:b9f4412e53f09d76b0991cdd29c0feff4c1d1e112b307e0ab155e5b050a9f4ec"

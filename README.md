@@ -84,12 +84,21 @@ Example output:
 installed: 19.2.3+snapcf306793a4  (1736)  117MB  held
 ```
 
-The version is `19.2.3`, so the image tag is `v19.2.3`. Update `image.ceph.tag` in `values.yaml` if you upgrade MicroCeph. Similarly, pin `image.kubectl.tag` to your MicroK8s version:
+The version is `19.2.3`, so the image tag is `v19.2.3`. Update `image.ceph.tag` in `values.yaml` if you upgrade MicroCeph.
 
-On a cluster node:
+For `bitnami/kubectl`, Bitnami no longer publishes versioned tags to Docker Hub — only `latest`. Rather than referencing the floating `latest` tag, the chart pins the image by its manifest list digest (`image.kubectl.digest` in `values.yaml`), which locks the exact image bytes regardless of what `latest` points to in the future. The Helm template helper in `_helpers.tpl` prefers the digest over the tag when `image.kubectl.digest` is set, rendering the reference as `bitnami/kubectl@sha256:...`.
+
+To update the digest after a MicroK8s upgrade, look up the current `latest` digest:
+
 ```bash
-snap info microk8s | grep installed
+TOKEN=$(curl -s 'https://auth.docker.io/token?service=registry.docker.io&scope=repository:bitnami/kubectl:pull' \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"])')
+curl -sI "https://registry-1.docker.io/v2/bitnami/kubectl/manifests/latest" \
+  -H "Accept: application/vnd.docker.distribution.manifest.list.v2+json" \
+  -H "Authorization: Bearer $TOKEN" | grep docker-content-digest
 ```
+
+Update `image.kubectl.digest` in `values.yaml` with the new digest, repackage, and run `helm upgrade`. The `image.kubectl.tag` field is kept as documentation of the intended version but is ignored whenever a digest is set.
 
 ## Key paths
 

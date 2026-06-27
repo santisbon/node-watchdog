@@ -12,7 +12,7 @@ metadata:
     "helm.sh/hook-weight": "-10"
     "helm.sh/hook-delete-policy": before-hook-creation
 ---
-# Grants the init SA permission to write the keyring Secret into this namespace.
+# Grants the init SA get/create/update/patch on all Secrets in this namespace (no resourceNames restriction; kubectl apply needs get+patch to update an existing Secret).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

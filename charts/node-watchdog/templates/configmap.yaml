@@ -17,7 +17,7 @@ data:
 
     log "Watchdog run starting"
 
-    NOTREADY_NODES=$($KUBECTL get nodes --no-headers | awk '$2 != "Ready" {print $1}')
+    NOTREADY_NODES=$($KUBECTL get nodes --no-headers | awk '$2 == "NotReady" {print $1}')
 
     if [ -z "$NOTREADY_NODES" ]; then
       log "All nodes Ready — exiting"
@@ -43,7 +43,7 @@ data:
           $KUBECTL delete pod "$POD" -n "$NS" --force --grace-period=0 2>/dev/null || true
         done
 
-      # Blocklist any Ceph clients still holding RBD locks from the dead node
+      # Blocklist any Ceph clients with open watchers on RBD images from the dead node
       for VOL in $(rbd ls "$POOL" 2>/dev/null); do
         WATCHER=$(rbd status "$POOL/$VOL" 2>/dev/null \
           | awk -v ip="$NODE_IP" \

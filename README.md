@@ -38,8 +38,10 @@ Rather than mounting that path directly into every watchdog pod run — which wo
 | Weight | Resource | Purpose |
 |--------|----------|---------|
 | -10 | `ServiceAccount` node-watchdog-init | Identity for the hook Job |
-| -5 | `Role` + `RoleBinding` node-watchdog-init | Grants permission to create/update Secrets in the release namespace |
+| -5 | `Role` + `RoleBinding` node-watchdog-init | Grants `get`/`create`/`update`/`patch` on Secrets in the release namespace |
 | 0 | `Job` node-watchdog-keyring-init | Mounts the MicroCeph conf dir from `cephNode` and writes `ceph-admin-keyring` Secret |
+
+Weights control execution order within the same hook phase: Helm sorts resources by weight (ascending) and applies each group before moving to the next. For simple resources like `ServiceAccount`, `Role`, and `RoleBinding`, Helm considers them applied the instant the API server accepts the request. For the `Job` (weight 0), Helm waits for it to reach a terminal state (succeeded or failed) before continuing. More negative = applied earlier. The real ordering constraint is that the `ServiceAccount` must exist before the `Job` pod can be scheduled (Kubernetes rejects a pod whose `serviceAccountName` doesn't exist); the `Role`/`RoleBinding` have no dependency on the SA existing — hence -10 → -5 → 0.
 
 The Job runs on `cephNode` (the only time node pinning is required). On `helm upgrade` the hook re-runs, so the Secret stays current if MicroCeph is upgraded between Helm releases.
 
@@ -49,17 +51,28 @@ Hook resources carry a `helm.sh/hook-delete-policy` annotation that controls cle
 
 | Resource | Delete policy | When it is deleted |
 |----------|--------------|-------------------|
-| `Job` node-watchdog-keyring-init | `before-hook-creation,hook-succeeded` | Deleted by Helm after it completes successfully; also deleted at the start of the next `helm upgrade` before a new one is created |
+| `Job` node-watchdog-keyring-init | `before-hook-creation,hook-succeeded` | Deleted by Helm after it completes successfully (`hook-succeeded`); if it fails, the Job persists until `before-hook-creation` removes it at the start of the next install or upgrade |
 | Pod created by the Job | (follows the Job) | Deleted together with the Job |
-| `ServiceAccount` node-watchdog-init | `before-hook-creation` | Persists after install; deleted only at the start of the next `helm upgrade` |
+| `ServiceAccount` node-watchdog-init | `before-hook-creation` | Persists after install; deleted at the start of the next `helm install` or `helm upgrade` if a resource with that name already exists |
 | `Role` + `RoleBinding` node-watchdog-init | `before-hook-creation` | Same as above |
 | `ceph-admin-keyring` Secret | none (not a hook) | Persists for the lifetime of the release; deleted only on `helm uninstall` |
 
 The Secret is intentionally not a hook resource. It must outlive the Job that created it so the CronJob can mount it on every run.
 
-## Ceph image version
+## Images
 
-The `quay.io/ceph/ceph` image in `cronjob.yaml` must match your MicroCeph version. To check:
+The chart uses two images that serve distinct roles. No single image ships both `ceph`/`rbd` and `kubectl`, so the chart assembles the tools it needs at runtime.
+
+**`quay.io/ceph/ceph`** — runs the watchdog script as the main CronJob container. The script calls `rbd ls` to enumerate volumes, `rbd status` to find open watchers from the dead node's IP, and `ceph osd blocklist add` to invalidate those client sessions; those CLIs only exist in a Ceph image.
+
+**`bitnami/kubectl`** — used in two places:
+
+- **Hook Job** (`hook-keyring-init.yaml`): reads `ceph.conf` and the admin keyring off the host filesystem and writes them into the `ceph-admin-keyring` Secret via `kubectl apply`. No Ceph tools are needed here — only `kubectl` talking to the API server.
+- **Init container** (`kubectl-provider` in the CronJob): copies the `kubectl` binary into a shared `emptyDir` volume before the watchdog container starts. The Ceph image has no `kubectl`, so this init container bridges the gap — the watchdog script calls `/shared/kubectl` to list `NotReady` nodes and force-delete stuck pods.
+
+### Version pinning
+
+The `quay.io/ceph/ceph` image must match your MicroCeph version. To check:
 
 On a cluster node:
 ```bash
@@ -88,6 +101,41 @@ snap info microk8s | grep installed
 | `ceph-admin-keyring` | Kubernetes Secret created by the hook; mounted as `/etc/ceph` in the CronJob pod |
 | `microk8s-rbd0` | RBD pool used by MicroK8s PersistentVolumes |
 
+## Volume types
+
+The chart uses three Kubernetes volume types, each with different lifetime and visibility guarantees.
+
+### emptyDir
+
+Created when the pod is scheduled and deleted when the pod terminates (or is evicted). It has no identity outside the pod — it is just scratch space on the node's disk (or in memory if `medium: Memory` is set). All containers in the same pod share it.
+
+Used here as `shared-bin`: the `kubectl-provider` init container writes the `kubectl` binary into it; the `watchdog` container reads it from `/shared/kubectl`. The binary disappears when the CronJob pod exits, which is fine — the next run gets a fresh copy from the image.
+
+### Secret volume
+
+A `Secret` is an API object stored in etcd. When mounted as a whole-directory volume, Kubernetes writes each key as a file under the mount path, base64-decoded, and updates the files automatically if the Secret changes (with a short propagation delay). This live-update behavior does not apply to `subPath` mounts, which require a pod restart to pick up changes. Secrets persist independently of any pod.
+
+Used here as `ceph-config`: the `ceph-admin-keyring` Secret is mounted read-only at `/etc/ceph` with mode `0600` so the Ceph CLI tools find `ceph.conf` and `ceph.client.admin.keyring` at the path they expect. The Secret outlives every CronJob pod and is only removed on `helm uninstall`.
+
+### ConfigMap volume
+
+Identical mechanism to a Secret volume, but stored in plain text in etcd and intended for non-sensitive configuration. Also persists independently of any pod.
+
+Used here as `scripts`: `watchdog.sh` is embedded inline in `templates/configmap.yaml` as a ConfigMap data key. Helm renders it into the `node-watchdog-script` ConfigMap, which is mounted at `/scripts` with mode `0755` so the script is executable inside the pod. To update the script, edit `templates/configmap.yaml`, repackage with `helm package`, and run `helm upgrade`. Because each CronJob run spawns a fresh pod, the next run automatically picks up whatever the ConfigMap contains at that point.
+
+### PersistentVolumes and PVCs — comparison
+
+| | emptyDir | Secret / ConfigMap | PersistentVolume + PVC |
+|---|---|---|---|
+| **Lifetime** | Pod | API object (independent of pods) | Independent of pods and nodes |
+| **Backed by** | Node disk / RAM | etcd | Real storage (RBD, NFS, cloud disk…) |
+| **Shared across pods** | No — one pod only | Yes — any pod that mounts it | Depends on access mode (`RWO` = one node; `RWX` = many) |
+| **Survives node loss** | No | Yes | Yes |
+| **Capacity limit** | Node free space | etcd object size limit (~1 MB) | Provisioned size |
+| **Use case** | Temporary inter-container hand-off | Config and credentials | Durable application data |
+
+The watchdog itself uses none of the workloads' PVCs — it only manipulates the Ceph RBD locks those PVCs hold. A PVC stays in `Bound` state throughout a recovery; only the lock holder changes from the dead node's client session to the replacement pod's.
+
 ## RBAC
 
 `rbac.yaml` defines a `ClusterRole` scoped to the minimum required verbs (`get`/`list` nodes, `get`/`list`/`delete` pods). It is safe to apply even if the MicroK8s `rbac` addon is currently disabled. The resources are stored but not enforced until you enable it:
@@ -95,6 +143,15 @@ snap info microk8s | grep installed
 ```bash
 microk8s enable rbac
 ```
+
+### How kubectl authenticates inside the pod
+
+No kubeconfig file is mounted. Instead, `kubectl` uses **in-cluster config**: when a pod is assigned a `serviceAccountName`, Kubernetes automatically mounts a signed token and the cluster CA cert into every container at `/var/run/secrets/kubernetes.io/serviceaccount/`, and injects `KUBERNETES_SERVICE_HOST` / `KUBERNETES_SERVICE_PORT` pointing at the API server. `kubectl` detects these and uses them without any extra configuration.
+
+- The **hook Job** runs as `node-watchdog-init`, which has the hook `Role` granting it `get`/`create`/`update`/`patch` on Secrets in the release namespace (`get` and `patch` are required by `kubectl apply`).
+- The **CronJob** runs as `node-watchdog`, which has the `ClusterRole` granting it `get`/`list` on nodes and `get`/`list`/`delete` on pods cluster-wide.
+
+The `kubectl` binary that the `kubectl-provider` init container copies into `/shared` works in the watchdog container because Kubernetes independently projects the pod's service account token into every container at `/var/run/secrets/kubernetes.io/serviceaccount/` — there is no shared volume involved. Any container in the pod can use `kubectl` and receive the same identity.
 
 ## Deploy
 

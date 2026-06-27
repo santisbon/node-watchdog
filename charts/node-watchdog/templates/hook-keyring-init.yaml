@@ -1,0 +1,95 @@
+---
+# Dedicated ServiceAccount for the hook Job — separate from the main watchdog SA.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-watchdog-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "node-watchdog.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation
+---
+# Grants the init SA permission to write the keyring Secret into this namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: node-watchdog-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "node-watchdog.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: node-watchdog-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "node-watchdog.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: node-watchdog-init
+subjects:
+  - kind: ServiceAccount
+    name: node-watchdog-init
+    namespace: {{ .Release.Namespace }}
+---
+# Reads ceph.conf and the admin keyring from the host and stores them as a
+# Secret. Runs once on helm install and again on helm upgrade, so the Secret
+# stays current if MicroCeph is upgraded between Helm releases.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: node-watchdog-keyring-init
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "node-watchdog.labels" . | nindent 4 }}
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  template:
+    spec:
+      serviceAccountName: node-watchdog-init
+      restartPolicy: OnFailure
+      nodeSelector:
+        kubernetes.io/hostname: {{ .Values.cephNode }}
+      containers:
+        - name: keyring-init
+          image: {{ .Values.image.kubectl.repository }}:{{ .Values.image.kubectl.tag }}
+          securityContext:
+            runAsUser: 0
+          command:
+            - sh
+            - -c
+            - |
+              kubectl create secret generic ceph-admin-keyring \
+                --from-file=ceph.conf=/mnt/ceph/ceph.conf \
+                --from-file=ceph.client.admin.keyring=/mnt/ceph/ceph.client.admin.keyring \
+                --namespace={{ .Release.Namespace }} \
+                --dry-run=client -o yaml | kubectl apply -f -
+          volumeMounts:
+            - name: ceph-config
+              mountPath: /mnt/ceph
+              readOnly: true
+      volumes:
+        - name: ceph-config
+          hostPath:
+            path: {{ .Values.microcephConfPath }}
+            type: Directory

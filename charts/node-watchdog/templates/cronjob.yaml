@@ -1,0 +1,58 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: node-watchdog
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "node-watchdog.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "node-watchdog.labels" . | nindent 12 }}
+        spec:
+          serviceAccountName: node-watchdog
+          restartPolicy: OnFailure
+          initContainers:
+            - name: kubectl-provider
+              image: {{ .Values.image.kubectl.repository }}:{{ .Values.image.kubectl.tag }}
+              command: ["sh", "-c", "cp $(which kubectl) /shared/kubectl"]
+              volumeMounts:
+                - name: shared-bin
+                  mountPath: /shared
+          containers:
+            - name: watchdog
+              image: {{ .Values.image.ceph.repository }}:{{ .Values.image.ceph.tag }}
+              command: ["/bin/bash", "/scripts/watchdog.sh"]
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 200m
+                  memory: 128Mi
+              volumeMounts:
+                - name: shared-bin
+                  mountPath: /shared
+                - name: ceph-config
+                  mountPath: /etc/ceph
+                  readOnly: true
+                - name: scripts
+                  mountPath: /scripts
+          volumes:
+            - name: shared-bin
+              emptyDir: {}
+            - name: ceph-config
+              secret:
+                secretName: ceph-admin-keyring
+                defaultMode: 0600
+            - name: scripts
+              configMap:
+                name: node-watchdog-script
+                defaultMode: 0755

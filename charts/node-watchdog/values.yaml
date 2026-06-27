@@ -1,0 +1,28 @@
+# Hostname of any node in the MicroCeph cluster. Used only by the keyring init
+# hook Job during helm install and helm upgrade to read the Ceph config from
+# the host filesystem. The watchdog CronJob itself is not pinned to this node
+# and will run on any available node after install.
+cephNode: node-01
+
+# RBD pool used by MicroK8s PersistentVolumes.
+cephPool: microk8s-rbd0
+
+# Path on the host where MicroCeph stores its config and admin keyring.
+microcephConfPath: /var/snap/microceph/current/conf
+
+# How often the watchdog runs, in cron syntax. The default (every 2 minutes)
+# is a reasonable balance between recovery speed and cluster overhead. Increase
+# the interval (e.g. "*/5 * * * *") if the cluster is resource-constrained.
+schedule: "*/2 * * * *"
+
+image:
+  ceph:
+    repository: quay.io/ceph/ceph
+    # Must match your MicroCeph version to ensure CLI compatibility.
+    # Check on node with: snap info microceph | grep installed
+    tag: v19.2.3
+  kubectl:
+    repository: bitnami/kubectl
+    # Must match your MicroK8s version to avoid API skew.
+    # Check on node with: snap info microk8s | grep installed
+    tag: "1.36.2"

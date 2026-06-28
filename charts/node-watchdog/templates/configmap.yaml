@@ -44,7 +44,7 @@ data:
         done
 
       # Blocklist any Ceph clients with open watchers on RBD images from the dead node
-      for VOL in $(rbd ls "$POOL" 2>/dev/null); do
+      for VOL in $(timeout 30 rbd ls "$POOL" 2>/dev/null); do
         WATCHER=$(rbd status "$POOL/$VOL" 2>/dev/null \
           | awk -v ip="$NODE_IP" \
               '$0 ~ "watcher="ip":" { sub(/.*watcher=/, ""); sub(/ .*/, ""); print }')

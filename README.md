@@ -4,6 +4,37 @@
 
 Kubernetes CronJob that automatically recovers workloads when a cluster node goes down in a homelab. It runs every 2 minutes, force-deletes pods stuck in `Terminating`, and blocklists stale Ceph RBD client locks so rescheduled pods can re-attach their volumes.
 
+## Table of contents
+
+- [Problem it solves](#problem-it-solves)
+- [How it works](#how-it-works)
+- [Prerequisites](#prerequisites)
+- [How the Ceph keyring is handled](#how-the-ceph-keyring-is-handled)
+  - [Keyring init hook](#keyring-init-hook)
+  - [What gets deleted and when](#what-gets-deleted-and-when)
+- [Images](#images)
+  - [Version pinning](#version-pinning)
+- [Key paths](#key-paths)
+- [Volume types](#volume-types)
+  - [emptyDir](#emptydir)
+  - [Secret volume](#secret-volume)
+  - [ConfigMap volume](#configmap-volume)
+  - [PersistentVolumes and PVCs — comparison](#persistentvolumes-and-pvcs--comparison)
+- [RBAC](#rbac)
+  - [How kubectl authenticates inside the pod](#how-kubectl-authenticates-inside-the-pod)
+- [Deploy](#deploy)
+  - [Package the chart](#package-the-chart)
+  - [Push to the MicroK8s built-in registry](#push-to-the-microk8s-built-in-registry)
+  - [Install from the registry](#install-from-the-registry)
+- [Verify](#verify)
+- [Full failure and recovery lifecycle](#full-failure-and-recovery-lifecycle)
+  - [Phase 1 — Node goes down](#phase-1--node-goes-down)
+  - [Phase 2 — Watchdog runs (within 2 minutes)](#phase-2--watchdog-runs-within-2-minutes)
+  - [Phase 3 — Node is rebooted and rejoins](#phase-3--node-is-rebooted-and-rejoins)
+- [Why not just use fencing like enterprise clusters do?](#why-not-just-use-fencing-like-enterprise-clusters-do)
+- [Tear down](#tear-down)
+- [Glossary](#glossary)
+
 ## Problem it solves
 
 When a node goes `NotReady`, Kubernetes can't confirm its pods have stopped, so they stay in `Terminating` indefinitely. Meanwhile, any `RWO` (ReadWriteOnce) Ceph RBD volumes those pods held remain locked by the dead node's client, blocking the replacement pod from mounting them on a healthy node. This watchdog breaks both locks automatically.
@@ -20,7 +51,7 @@ On each run the script:
 ## Prerequisites
 
 - MicroK8s cluster with MicroCeph
-- Helm 3
+- Helm
 - `kubectl` access from the machine you deploy from
 
 ## How the Ceph keyring is handled

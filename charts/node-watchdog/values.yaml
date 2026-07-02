@@ -1,8 +1,25 @@
 # Hostname of any node in the MicroCeph cluster. Used only by the keyring init
 # hook Job during helm install and helm upgrade to read the Ceph config from
-# the host filesystem. The watchdog CronJob itself is not pinned to this node
-# and will run on any available node after install.
+# the host filesystem.
 cephNode: node-01
+
+# Node the watchdog CronJob's pod should preferentially be scheduled on.
+# Left empty to disable and let the scheduler place it anywhere.
+#
+# Default it to the cluster's control-plane node: if that node is ever down,
+# the API server is unreachable and nothing gets scheduled cluster-wide
+# anyway, so it's the one node where "the watchdog's own pod lands on the
+# node that's failing" isn't a risk. Worker nodes are the ones more likely
+# to go NotReady under memory/resource pressure — if the watchdog pod is
+# co-scheduled onto whichever one of those is currently failing, it can't
+# do its job during exactly the window it exists for (it would end up
+# stuck `Terminating` alongside the workloads it's supposed to rescue,
+# unable to run until that node recovers on its own).
+#
+# This is a soft preference (preferredDuringSchedulingIgnoredDuringExecution),
+# not a hard requirement, so the watchdog still runs somewhere if this node
+# is cordoned or otherwise unschedulable rather than getting stuck Pending.
+preferredNode: node-01
 
 # RBD pool used by MicroK8s PersistentVolumes.
 cephPool: microk8s-rbd0

@@ -19,6 +19,18 @@ spec:
         spec:
           serviceAccountName: node-watchdog
           restartPolicy: OnFailure
+          {{- with .Values.preferredNode }}
+          affinity:
+            nodeAffinity:
+              preferredDuringSchedulingIgnoredDuringExecution:
+                - weight: 100
+                  preference:
+                    matchExpressions:
+                      - key: kubernetes.io/hostname
+                        operator: In
+                        values:
+                          - {{ . }}
+          {{- end }}
           initContainers:
             - name: kubectl-provider
               image: {{ include "node-watchdog.image" .Values.image.kubectl }}

@@ -8,6 +8,7 @@ Kubernetes CronJob that automatically recovers workloads when a cluster node goe
 
 - [Problem it solves](#problem-it-solves)
 - [How it works](#how-it-works)
+- [Scheduling: keeping the watchdog off the node it's watching](#scheduling-keeping-the-watchdog-off-the-node-its-watching)
 - [Prerequisites](#prerequisites)
 - [How the Ceph keyring is handled](#how-the-ceph-keyring-is-handled)
   - [Keyring init hook](#keyring-init-hook)
@@ -48,6 +49,20 @@ On each run the script:
 3. Scans every RBD volume in the `microk8s-rbd0` pool for watchers from the dead node's IP
 4. Calls `ceph osd blocklist add <watcher>` for each match, releasing the lock
 
+## Scheduling: keeping the watchdog off the node it's watching
+
+The CronJob's pod has no scheduling constraints by default, so it can land on any node, including the exact node that's about to go `NotReady`. If that happens, the watchdog pod becomes just as stuck as everything else during the one window it exists to handle, and can't force-delete anything or touch the blocklist until the node it's on recovers.
+
+A watchdog pod scheduled onto the same node that's about to fail (e.g. a memory-constrained worker node hitting an OOM condition) can end up stuck `Terminating` right alongside the application pods it's supposed to rescue, unable to run until that node recovers on its own.
+
+This isn't just a missed window; it stalls every run after it, too. The CronJob sets `concurrencyPolicy: Forbid`, so if the previous Job hasn't reached a terminal state (`Complete`/`Failed`), the controller skips the next scheduled tick instead of starting a fresh pod alongside it. A pod stuck `Terminating` counts as still active, so once this happens every subsequent 2-minute tick is silently skipped (not retried on a possibly healthy node) until the affected node rejoins and kubelet can finally confirm the pod is gone, or someone manually deletes the stuck Job. `Forbid` exists to stop two runs from racing on the same force-delete/blocklist actions concurrently, but it means a watchdog pod wedged on a dying node blocks recovery entirely rather than just delaying it.
+
+The chart sets a soft node-affinity preference (`values.preferredNode`, default `node-01`) toward the cluster's control-plane node. The reasoning: if the control-plane node is ever down, the API server is unreachable and nothing gets scheduled cluster-wide anyway so it's the one node where "the watchdog pod is co-located with the node that's failing" isn't a risk in the first place. Worker nodes are more likely to be the ones under memory or resource pressure, so keeping the watchdog off them in favor of the control-plane node meaningfully reduces the chance of the watchdog pod itself getting wedged on a node that's failing.
+
+It's a `preferredDuringSchedulingIgnoredDuringExecution` preference, not a hard requirement, so the watchdog still gets scheduled somewhere (just not necessarily `preferredNode`) if that node is cordoned or otherwise temporarily unschedulable, rather than sitting `Pending`.
+
+Set `preferredNode: ""` to disable this and let the scheduler place the pod freely, or point it at a different node if your control-plane node isn't `node-01`.
+
 ## Prerequisites
 
 - MicroK8s cluster with MicroCeph
@@ -72,7 +87,7 @@ Rather than mounting that path directly into every watchdog pod run — which wo
 | -5 | `Role` + `RoleBinding` node-watchdog-init | Grants `get`/`create`/`update`/`patch` on Secrets in the release namespace |
 | 0 | `Job` node-watchdog-keyring-init | Mounts the MicroCeph conf dir from `cephNode` and writes `ceph-admin-keyring` Secret |
 
-Weights control execution order within the same hook phase: Helm sorts resources by weight (ascending) and applies each group before moving to the next. For simple resources like `ServiceAccount`, `Role`, and `RoleBinding`, Helm considers them applied the instant the API server accepts the request. For the `Job` (weight 0), Helm waits for it to reach a terminal state (succeeded or failed) before continuing. More negative = applied earlier. The real ordering constraint is that the `ServiceAccount` must exist before the `Job` pod can be scheduled (Kubernetes rejects a pod whose `serviceAccountName` doesn't exist); the `Role`/`RoleBinding` have no dependency on the SA existing — hence -10 → -5 → 0.
+Weights control execution order within the same hook phase: Helm sorts resources by weight (ascending) and applies each group before moving to the next. For simple resources like `ServiceAccount`, `Role`, and `RoleBinding`, Helm considers them applied the instant the API server accepts the request. For the `Job` (weight 0), Helm waits for it to reach a terminal state (succeeded or failed) before continuing. More negative = applied earlier. The real ordering constraint is that the `ServiceAccount` must exist before the `Job` pod can be scheduled (Kubernetes rejects a pod whose `serviceAccountName` doesn't exist); the `Role`/`RoleBinding` have no dependency on the SA existing; hence -10 → -5 → 0.
 
 The Job runs on `cephNode` (the only time node pinning is required). On `helm upgrade` the hook re-runs, so the Secret stays current if MicroCeph is upgraded between Helm releases.
 
@@ -98,8 +113,8 @@ The chart uses two images that serve distinct roles. No single image ships both 
 
 **`bitnami/kubectl`** — used in two places:
 
-- **Hook Job** (`hook-keyring-init.yaml`): reads `ceph.conf` and the admin keyring off the host filesystem and writes them into the `ceph-admin-keyring` Secret via `kubectl apply`. No Ceph tools are needed here — only `kubectl` talking to the API server.
-- **Init container** (`kubectl-provider` in the CronJob): copies the `kubectl` binary into a shared `emptyDir` volume before the watchdog container starts. The Ceph image has no `kubectl`, so this init container bridges the gap — the watchdog script calls `/shared/kubectl` to list `NotReady` nodes and force-delete stuck pods.
+- **Hook Job** (`hook-keyring-init.yaml`): reads `ceph.conf` and the admin keyring off the host filesystem and writes them into the `ceph-admin-keyring` Secret via `kubectl apply`. No Ceph tools are needed here; only `kubectl` talking to the API server.
+- **Init container** (`kubectl-provider` in the CronJob): copies the `kubectl` binary into a shared `emptyDir` volume before the watchdog container starts. The Ceph image has no `kubectl`, so this init container bridges the gap. The watchdog script calls `/shared/kubectl` to list `NotReady` nodes and force-delete stuck pods.
 
 ### Version pinning
 
@@ -117,7 +132,7 @@ installed: 19.2.3+snapcf306793a4  (1736)  117MB  held
 
 The version is `19.2.3`, so the image tag is `v19.2.3`. Update `image.ceph.tag` in `values.yaml` if you upgrade MicroCeph.
 
-For `bitnami/kubectl`, Bitnami no longer publishes versioned tags to Docker Hub — only `latest`. Rather than referencing the floating `latest` tag, the chart pins the image by its manifest list digest (`image.kubectl.digest` in `values.yaml`), which locks the exact image bytes regardless of what `latest` points to in the future. The Helm template helper in `_helpers.tpl` prefers the digest over the tag when `image.kubectl.digest` is set, rendering the reference as `bitnami/kubectl@sha256:...`.
+For `bitnami/kubectl`, Bitnami no longer publishes versioned tags to Docker Hub; only `latest`. Rather than referencing the floating `latest` tag, the chart pins the image by its manifest list digest (`image.kubectl.digest` in `values.yaml`), which locks the exact image bytes regardless of what `latest` points to in the future. The Helm template helper in `_helpers.tpl` prefers the digest over the tag when `image.kubectl.digest` is set, rendering the reference as `bitnami/kubectl@sha256:...`.
 
 To update the digest after a MicroK8s upgrade, look up the current `latest` digest:
 
@@ -147,9 +162,9 @@ The chart uses three Kubernetes volume types, each with different lifetime and v
 
 ### emptyDir
 
-Created when the pod is scheduled and deleted when the pod terminates (or is evicted). It has no identity outside the pod — it is just scratch space on the node's disk (or in memory if `medium: Memory` is set). All containers in the same pod share it.
+Created when the pod is scheduled and deleted when the pod terminates (or is evicted). It has no identity outside the pod. It is just scratch space on the node's disk (or in memory if `medium: Memory` is set). All containers in the same pod share it.
 
-Used here as `shared-bin`: the `kubectl-provider` init container writes the `kubectl` binary into it; the `watchdog` container reads it from `/shared/kubectl`. The binary disappears when the CronJob pod exits, which is fine — the next run gets a fresh copy from the image.
+Used here as `shared-bin`: the `kubectl-provider` init container writes the `kubectl` binary into it; the `watchdog` container reads it from `/shared/kubectl`. The binary disappears when the CronJob pod exits, which is fine. The next run gets a fresh copy from the image.
 
 ### Secret volume
 
@@ -174,7 +189,7 @@ Used here as `scripts`: `watchdog.sh` is embedded inline in `templates/configmap
 | **Capacity limit** | Node free space | etcd object size limit (~1 MB) | Provisioned size |
 | **Use case** | Temporary inter-container hand-off | Config and credentials | Durable application data |
 
-The watchdog itself uses none of the workloads' PVCs — it only manipulates the Ceph RBD locks those PVCs hold. A PVC stays in `Bound` state throughout a recovery; only the lock holder changes from the dead node's client session to the replacement pod's.
+The watchdog itself uses none of the workloads' PVCs. It only manipulates the Ceph RBD locks those PVCs hold. A PVC stays in `Bound` state throughout a recovery; only the lock holder changes from the dead node's client session to the replacement pod's.
 
 ## RBAC
 
@@ -191,7 +206,7 @@ No kubeconfig file is mounted. Instead, `kubectl` uses **in-cluster config**: wh
 - The **hook Job** runs as `node-watchdog-init`, which has the hook `Role` granting it `get`/`create`/`update`/`patch` on Secrets in the release namespace (`get` and `patch` are required by `kubectl apply`).
 - The **CronJob** runs as `node-watchdog`, which has the `ClusterRole` granting it `get`/`list` on nodes and `get`/`list`/`delete` on pods cluster-wide.
 
-The `kubectl` binary that the `kubectl-provider` init container copies into `/shared` works in the watchdog container because Kubernetes independently projects the pod's service account token into every container at `/var/run/secrets/kubernetes.io/serviceaccount/` — there is no shared volume involved. Any container in the pod can use `kubectl` and receive the same identity.
+The `kubectl` binary that the `kubectl-provider` init container copies into `/shared` works in the watchdog container because Kubernetes independently projects the pod's service account token into every container at `/var/run/secrets/kubernetes.io/serviceaccount/`; there is no shared volume involved. Any container in the pod can use `kubectl` and receive the same identity.
 
 ## Deploy
 
@@ -201,7 +216,7 @@ The `kubectl` binary that the `kubectl-provider` init container copies into `/sh
 helm package charts/node-watchdog
 ```
 
-This produces `node-watchdog-0.1.0.tgz` (version comes from `Chart.yaml`).
+This produces `node-watchdog-$VERSION.tgz` (version comes from `Chart.yaml`).
 
 ### Push to the MicroK8s built-in registry
 
@@ -221,14 +236,16 @@ curl -s http://node-01.local:32000/v2/_catalog | jq
 curl -s http://node-01.local:32000/v2/charts/node-watchdog/tags/list | jq
 
 # Inspect chart metadata for a specific version
-helm show chart oci://node-01.local:32000/charts/node-watchdog --version 0.1.0 --plain-http
+helm show chart oci://node-01.local:32000/charts/node-watchdog --version $VERSION --plain-http
 ```
 
 ### Install from the registry
 
 ```bash
+VERSION= # choose version to install
+
 helm upgrade --install node-watchdog oci://node-01.local:32000/charts/node-watchdog \
-  --version 0.1.0 --plain-http \
+  --version $VERSION --plain-http \
   --namespace node-watchdog \
   --create-namespace \
   --set cephNode=node-01
@@ -291,15 +308,15 @@ A recovery run looks like:
 - Scans every RBD volume for watchers matching the dead node's IP and calls `ceph osd blocklist add` for each one
 - Ceph immediately invalidates those client sessions and releases their locks
 - The CSI driver on the healthy node retries, successfully maps the RBD images, and the replacement pods move from `ContainerCreating` to `Running`
-- PVCs remain in `Bound` state throughout — only their lock holder changes
+- PVCs remain in `Bound` state throughout; only their lock holder changes
 
 ### Phase 3 — Node is rebooted and rejoins
 
 - The node's Kubernetes status returns to `Ready`
-- Its Ceph OSD (e.g. `osd.2`) starts a fresh client session with a new random nonce — a completely different session identity from the one that was blocklisted
+- Its Ceph OSD (e.g. `osd.2`) starts a fresh client session with a new random nonce; a completely different session identity from the one that was blocklisted
 - The new session is not on the blocklist, so the OSD reconnects to the monitors without issue
 - Ceph begins re-replicating the data that was degraded while the OSD was absent; the cluster returns to `HEALTH_OK` once replication is complete
-- The old blocklist entry (tied to the previous session's nonce) expires harmlessly within 1 hour — no manual cleanup required
+- The old blocklist entry (tied to the previous session's nonce) expires harmlessly within 1 hour; no manual cleanup required
 - The watchdog finds all nodes `Ready` on its next run and exits immediately without taking any action
 - PVCs stay attached to the healthy node where the replacement pods are running; Kubernetes does not move them back unless those pods are rescheduled onto the recovered node
 
@@ -307,7 +324,7 @@ A recovery run looks like:
 
 Enterprise clusters solve this at the hardware level using **fencing**, also called STONITH (Shoot The Other Node In The Head). A fencing agent — IPMI, iDRAC, iLO, a smart PDU, or a cloud provider API — can physically power off a dead node on demand. Once the node is confirmed dead at the hardware level, Ceph's watcher timeout (~30 seconds) clears the RBD lock naturally because the dead client can never send another heartbeat. No blocklist command is needed.
 
-Without fencing you can't be sure the node is truly gone — it might be network-partitioned but still running. If it came back while another pod held the volume, both would think they owned it, risking data corruption. The blocklist is what you reach for when you can't guarantee the node is dead.
+Without fencing you can't be sure the node is truly gone; it might be network-partitioned but still running. If it came back while another pod held the volume, both would think they owned it, risking data corruption. The blocklist is what you reach for when you can't guarantee the node is dead.
 
 **How enterprise environments handle it:**
 
@@ -315,7 +332,7 @@ Without fencing you can't be sure the node is truly gone — it might be network
 - **Managed Kubernetes (EKS, GKE, AKS)** — the cloud provider API is the fencing agent. The node group or autoscaler terminates the VM, giving an instant hardware-level guarantee.
 - **RHCS / VMware** — Pacemaker/Corosync with a dedicated fencing agent per host.
 
-**Why this cluster needs the watchdog instead:** Raspberry Pis have no IPMI or BMC — there is no hardware management interface to pull the plug remotely. Software-only remediation is the best available option without adding a smart PDU to the rack. A network-controlled PDU would act as a fencing agent and eliminate this problem class entirely.
+**Why this cluster needs the watchdog instead:** Raspberry Pis have no IPMI or BMC so there is no hardware management interface to pull the plug remotely. Software-only remediation is the best available option without adding a smart PDU to the rack. A network-controlled PDU would act as a fencing agent and eliminate this problem class entirely.
 
 ## Tear down
 
@@ -329,22 +346,22 @@ kubectl delete namespace node-watchdog
 | Term | Definition |
 |------|-----------|
 | **AKS** | Azure Kubernetes Service — Microsoft's managed Kubernetes offering |
-| **CephX** | Ceph's internal authentication system. Each user (e.g. `client.admin`) has a base64-encoded secret key stored in a keyring file. Clients present this key to the monitors to prove their identity before accessing the cluster |
-| **Helm hook** | A Kubernetes resource annotated with `helm.sh/hook` so that Helm runs it at a specific point in the release lifecycle (e.g. `pre-install` before any chart resources are created). Hook resources are managed separately from the main chart and can be deleted automatically on completion |
-| **Helm** | Package manager for Kubernetes. A chart is a collection of templated manifests with a `values.yaml` for configuration; `helm install` renders the templates and applies them to the cluster |
 | **BMC** | Baseboard Management Controller — a dedicated chip on server motherboards that provides out-of-band management (power control, console access) independent of the OS |
 | **Ceph** | Open-source distributed storage system providing block, file, and object storage |
+| **CephX** | Ceph's internal authentication system. Each user (e.g. `client.admin`) has a base64-encoded secret key stored in a keyring file. Clients present this key to the monitors to prove their identity before accessing the cluster |
 | **CronJob** | Kubernetes resource that runs a Job on a repeating schedule |
 | **CSI** | Container Storage Interface — standard API for exposing storage systems to containerized workloads |
 | **EKS** | Elastic Kubernetes Service — AWS's managed Kubernetes offering |
 | **Fencing** | The act of forcibly isolating a failed node to guarantee it can no longer access shared resources, preventing data corruption |
 | **GKE** | Google Kubernetes Engine — Google Cloud's managed Kubernetes offering |
+| **Helm** | Package manager for Kubernetes. A chart is a collection of templated manifests with a `values.yaml` for configuration; `helm install` renders the templates and applies them to the cluster |
+| **Helm hook** | A Kubernetes resource annotated with `helm.sh/hook` so that Helm runs it at a specific point in the release lifecycle (e.g. `pre-install` before any chart resources are created). Hook resources are managed separately from the main chart and can be deleted automatically on completion |
 | **iDRAC** | Integrated Dell Remote Access Controller — Dell's BMC implementation |
 | **iLO** | Integrated Lights-Out — HPE's BMC implementation |
 | **IPMI** | Intelligent Platform Management Interface — industry standard protocol for out-of-band server management via the BMC |
+| **Medik8s** | A set of Kubernetes operators (Node Health Check, Self Node Remediation) for automated bare-metal node remediation |
 | **MicroCeph** | Canonical's lightweight Ceph distribution, packaged as a snap, designed for small clusters |
 | **MicroK8s** | Canonical's lightweight Kubernetes distribution, packaged as a snap |
-| **Medik8s** | A set of Kubernetes operators (Node Health Check, Self Node Remediation) for automated bare-metal node remediation |
 | **OSD** | Object Storage Daemon — the Ceph process that manages one storage device (disk) and handles data replication |
 | **PDU** | Power Distribution Unit — a rack-mounted power strip; a "smart PDU" adds network control for remote power cycling, enabling software fencing |
 | **PVC** | PersistentVolumeClaim — a Kubernetes request for storage, bound to a PersistentVolume |
